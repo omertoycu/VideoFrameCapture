@@ -8,16 +8,13 @@ import time
 import numpy as np
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
 
 from utils import CaptureAngle, is_frame_sharp, crop_face_region
 
 
-# ─── Yapılandırma ─────────────────────────────────────────────────────────────
-
 @dataclass
 class AngleConfig:
-    """Bir çekim açısının kabul aralığı."""
     angle_type:      CaptureAngle
     yaw_min:         float
     yaw_max:         float
@@ -27,14 +24,12 @@ class AngleConfig:
 
 @dataclass
 class CaptureState:
-    """Tek bir açı için çekim + animasyon durumu."""
-    is_captured:      bool  = False
-    flash_start:      float = 0.0
-    flash_duration:   float = 0.55   # saniye
-    last_capture:     float = 0.0
-    cooldown:         float = 2.0    # saniye
+    is_captured:    bool  = False
+    flash_start:    float = 0.0
+    flash_duration: float = 0.55
+    last_capture:   float = 0.0
+    cooldown:       float = 2.0
 
-    # ── Flash alpha (0→1→0 sinüs eğrisi) ─────────────────────────────────────
     @property
     def flash_alpha(self) -> float:
         if self.flash_start == 0.0:
@@ -56,21 +51,14 @@ class CaptureState:
         return (time.time() - self.last_capture) < self.cooldown
 
 
-# ─── CaptureManager ───────────────────────────────────────────────────────────
-
 class CaptureManager:
-    """
-    Her kare için:
-      1. Yaw/pitch/roll açılarının hedef aralıkta olup olmadığını kontrol eder.
-      2. Laplacian ile netliği ölçer.
-      3. Koşullar sağlandığında temiz kareyi (çizimsiz) diske yazar.
-      4. Flaş animasyonu için zamanlayıcı tutar.
-    """
-
     ANGLE_CONFIGS = [
-        AngleConfig(CaptureAngle.FRONT, yaw_min=-15.0, yaw_max=15.0),
-        AngleConfig(CaptureAngle.LEFT,  yaw_min=-60.0, yaw_max=-35.0),
-        AngleConfig(CaptureAngle.RIGHT, yaw_min= 35.0, yaw_max= 60.0),
+        AngleConfig(CaptureAngle.FRONT, yaw_min=-15.0, yaw_max=15.0,
+                    pitch_tolerance=25.0, roll_tolerance=25.0),
+        AngleConfig(CaptureAngle.LEFT, yaw_min=-65.0, yaw_max=-25.0,
+                    pitch_tolerance=35.0, roll_tolerance=35.0),
+        AngleConfig(CaptureAngle.RIGHT, yaw_min=25.0, yaw_max=65.0,
+                    pitch_tolerance=35.0, roll_tolerance=35.0),
     ]
 
     def __init__(
@@ -88,11 +76,7 @@ class CaptureManager:
         self.session_dir.mkdir(parents=True, exist_ok=True)
         print(f"[CaptureManager] Kayit klasoru: {self.session_dir}")
 
-        self.states: dict[CaptureAngle, CaptureState] = {
-            a: CaptureState() for a in CaptureAngle
-        }
-
-    # ── İç Yardımcılar ───────────────────────────────────────────────────────
+        self.states: dict = {a: CaptureState() for a in CaptureAngle}
 
     def _active_config(
         self, yaw: float, pitch: float, roll: float
@@ -105,20 +89,18 @@ class CaptureManager:
         return None
 
     def _save(
-            self,
-            clean: np.ndarray,
-            landmarks,
-            angle: CaptureAngle,
+        self,
+        clean: np.ndarray,
+        landmarks,
+        angle: CaptureAngle,
     ) -> Optional[str]:
-        ts = time.strftime("%H%M%S")
+        ts   = time.strftime("%H%M%S")
         path = self.session_dir / f"{angle.value}_{ts}.jpg"
 
-        # Kayıt için kullanılacak görüntüyü belirle
         if self.save_full_frame or not landmarks:
             img = clean
         else:
             cropped = crop_face_region(clean, landmarks, 0.3)
-            # ← 'or' YOK, explicit None kontrolü var
             if cropped is not None:
                 img = cropped
             else:
@@ -131,51 +113,52 @@ class CaptureManager:
         print(f"[!!] Kayit basarisiz: {path}")
         return None
 
-    # ── Ana Metot ─────────────────────────────────────────────────────────────
-
     def process_frame(
         self,
         clean_frame: np.ndarray,
-        yaw: float,
-        pitch: float,
-        roll: float,
+        yaw:         float,
+        pitch:       float,
+        roll:        float,
         landmarks,
     ) -> dict:
         """
-        Her döngü adımında çağrılır.
-
-        Args:
-            clean_frame : Üzerinde çizim OLMAYAN orijinal kare (kayıt için).
-            yaw/pitch/roll : Hesaplanmış açılar.
-            landmarks   : NormalizedLandmark listesi (yüz kırpma için).
+        Her kare için çağrılır.
 
         Returns:
-            {
-              'captured'   : bool,
-              'angle_type' : CaptureAngle | None,
-              'sharpness'  : float,
-              'filepath'   : str | None,
-            }
+            captured    : Bu karede yeni çekim yapıldı mı
+            angle_type  : Hangi açı aralığındayız (veya None)
+            sharpness   : Anlık netlik skoru (her zaman hesaplanır)
+            filepath    : Kaydedilen dosya yolu (veya None)
         """
-        result = dict(captured=False, angle_type=None,
-                      sharpness=0.0, filepath=None)
+        # ── Netliği HER ZAMAN hesapla (UI göstergesi için) ──────────────────
+        sharp_ok, sharpness_score = is_frame_sharp(
+            clean_frame, self.sharpness_threshold
+        )
 
+        result = dict(
+            captured   = False,
+            angle_type = None,
+            sharpness  = sharpness_score,   # ← her zaman dolu
+            filepath   = None,
+        )
+
+        # ── Hangi açı aralığındayız? ─────────────────────────────────────────
         cfg = self._active_config(yaw, pitch, roll)
         if cfg is None:
-            return result
+            return result   # Tanımlı aralık dışı, netlik yine de dönüyor
 
         result['angle_type'] = cfg.angle_type
         state = self.states[cfg.angle_type]
 
+        # ── Zaten çekildiyse veya cooldown'daysa dur ─────────────────────────
         if state.is_captured or state.in_cooldown():
             return result
 
-        sharp_ok, score = is_frame_sharp(clean_frame, self.sharpness_threshold)
-        result['sharpness'] = score
-
+        # ── Netlik yetersizse dur ────────────────────────────────────────────
         if not sharp_ok:
             return result
 
+        # ── Çekimi gerçekleştir ──────────────────────────────────────────────
         fp = self._save(clean_frame, landmarks, cfg.angle_type)
         if fp:
             state.is_captured = True

@@ -189,6 +189,15 @@ def main() -> None:
             show_mesh = not show_mesh
             print(f"[m] Mesh: {'acik' if show_mesh else 'kapali'}")
 
+        # ── DEBUG: Açıları terminale yaz ────────────────────────
+        if head_pose.is_detected:
+            print(
+                f"\rYaw:{head_pose.yaw:+6.1f} "
+                f"Pitch:{head_pose.pitch:+6.1f} "
+                f"Roll:{head_pose.roll:+6.1f}  ",
+                end="", flush=True
+            )
+
     cap.release()
     tracker.release()
     cv2.destroyAllWindows()
